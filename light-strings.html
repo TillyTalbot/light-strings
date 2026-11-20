@@ -40,15 +40,17 @@
   <h1>Light Strings</h1>
   <p>Pinch your thumb and index finger and pull to stretch a string of light.
      Pinch with both hands to stretch one between them. Let go and it stays hanging in the air.
-     Swipe a finger through a string to pluck it.</p>
+     Flick your index finger through a string to pluck it — or tap Harp for a ready-made set.</p>
   <button id="go">Start camera</button>
   <div id="status"></div>
 </div>
 
-<div id="hint" class="hidden">Pinch &amp; pull to make a string · swipe a fingertip through it to pluck</div>
+<div id="hint" class="hidden">Pinch &amp; pull to make a string · flick your index finger through it to pluck · Harp = ready-made strings</div>
 <div id="bar" class="hidden">
   <button id="bSkel" class="on" title="H">Skeleton</button>
   <button id="bSound" class="on" title="M">Sound</button>
+  <button id="bHarp" title="P">Harp</button>
+  <button id="bMono" title="B">Mono</button>
   <button id="bClear" title="C">Clear</button>
   <button id="rec" title="R">● Record</button>
 </div>
@@ -60,14 +62,20 @@ import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@m
 const SETTINGS = {
   pinchOn: 0.30,          // thumb–index distance (relative to hand size) that counts as a pinch
   pinchOff: 0.42,         // distance at which the pinch lets go (a gap here stops flicker)
-  maxStrings: 14,         // older strings fade out after this many
+  maxStrings: 8,          // older strings fade out after this many
+  pluckFingers: [8],      // which fingertips pluck: 8 = index only (add 12 for middle finger)
+  minPluckSpeed: 250,     // px per second: slower brushes don't trigger a note
+  pluckCooldown: 280,     // ms before the same string can sound again
+  maxVoices: 6,           // most notes ringing at once, so it never turns to mush
+  hum: true,              // a held string sings and slides in pitch as you stretch it
+  reverb: 0.22,           // 0 = dry, 0.5 = cathedral
   minLength: 50,          // px: shorter strings are thrown away
   wobbleSpeed: 34,        // how fast the string visibly vibrates
   decay: 2.2,             // how quickly a plucked string settles
   darken: 0.30,           // how much the camera image is dimmed so the light pops
   palette: [190, 320, 95, 45, 265, 160],   // hues used for plucks (cyan, pink, lime, gold, violet, mint)
   scale: [0, 2, 4, 7, 9], // pentatonic: every note sounds good together
-  lowNote: 48, highNote: 84 // MIDI range (C3 – C6)
+  lowNote: 45, highNote: 72 // MIDI range (A2 – C5): a narrower, warmer range
 };
 
 /* ---------------- setup ---------------- */
@@ -114,7 +122,18 @@ document.getElementById('go').onclick = async () => {
 };
 
 /* ---------------- sound: plucked strings (Karplus–Strong) + reverb ---------------- */
-let actx, master, recordDest;
+let actx, master, recordDest, hum = null, voices = 0;
+function setHum(freq, on) {
+  if (!hum) return;
+  const t = actx.currentTime;
+  if (on && soundOn && SETTINGS.hum) {
+    hum.o1.frequency.setTargetAtTime(freq, t, 0.06);       // smooth slide between notes, like the original
+    hum.o2.frequency.setTargetAtTime(freq * 2, t, 0.06);
+    hum.g.gain.setTargetAtTime(0.09, t, 0.15);
+  } else {
+    hum.g.gain.setTargetAtTime(0, t, 0.12);
+  }
+}
 const bufCache = new Map();
 function initAudio() {
   if (actx) return;
@@ -122,8 +141,15 @@ function initAudio() {
   master = actx.createGain(); master.gain.value = 0.8;
   const comp = actx.createDynamicsCompressor();
   const verb = actx.createConvolver(); verb.buffer = makeImpulse(3.2);
-  const wet = actx.createGain(); wet.gain.value = 0.38;
+  const wet = actx.createGain(); wet.gain.value = SETTINGS.reverb;
   master.connect(comp); master.connect(verb); verb.connect(wet); wet.connect(comp);
+  // the "hum": a soft bowed tone that slides with the held string's length
+  hum = { o1: actx.createOscillator(), o2: actx.createOscillator(), f: actx.createBiquadFilter(), g: actx.createGain() };
+  hum.o1.type = 'sine'; hum.o2.type = 'triangle'; hum.o2.detune.value = 7;
+  hum.f.type = 'lowpass'; hum.f.frequency.value = 1400; hum.g.gain.value = 0;
+  const o2g = actx.createGain(); o2g.gain.value = 0.35;
+  hum.o1.connect(hum.f); hum.o2.connect(o2g); o2g.connect(hum.f); hum.f.connect(hum.g); hum.g.connect(master);
+  hum.o1.start(); hum.o2.start();
   comp.connect(actx.destination);
   recordDest = actx.createMediaStreamDestination(); comp.connect(recordDest);
 }
@@ -148,8 +174,9 @@ function pluckBuffer(freq) {
   bufCache.set(key, b); return b;
 }
 function playNote(freq, strength, x) {
-  if (!soundOn || !actx) return;
+  if (!soundOn || !actx || voices >= SETTINGS.maxVoices) return;
   const src = actx.createBufferSource(); src.buffer = pluckBuffer(freq);
+  voices++; src.onended = () => voices--;
   const g = actx.createGain(); g.gain.value = 0.25 + 0.6 * strength;
   const pan = actx.createStereoPanner(); pan.pan.value = Math.max(-1, Math.min(1, (x / W) * 2 - 1)) * 0.8;
   src.connect(g); g.connect(pan); pan.connect(master); src.start();
@@ -284,7 +311,7 @@ function processHands(result, view, now, dt) {
     h.pts = pts;
 
     // plucking: fingertips of this hand that aren't busy pinching
-    const tips = h.pinching ? [12, 16, 20] : [8, 12, 16, 20];
+    const tips = h.pinching ? [] : SETTINGS.pluckFingers;
     for (const tip of tips) {
       const key = label + '-' + tip, cur = pts[tip], prev = prevTips[key];
       if (prev && dist(prev, cur) < W * 0.35) {
@@ -292,7 +319,8 @@ function processHands(result, view, now, dt) {
         for (const s of strings) {
           if (s.dying) continue;
           const hit = segIntersect(s.a, s.b, prev, cur);
-          if (hit && hit.t > 0.06 && hit.t < 0.94 && now - (s.cool[key] || 0) > 160) {
+          if (hit && hit.t > 0.06 && hit.t < 0.94 && speed > SETTINGS.minPluckSpeed && now - (s.lastHit || 0) > SETTINGS.pluckCooldown) {
+            s.lastHit = now;
             s.cool[key] = now;
             pluck(s, hit.t, speed, { x: lerp(s.a.x, s.b.x, hit.t), y: lerp(s.a.y, s.b.y, hit.t) }, now);
           }
@@ -313,9 +341,11 @@ function processHands(result, view, now, dt) {
   if (target) {
     if (!liveString) { liveString = makeString(target[0], target[1], true); liveString.hue = SETTINGS.palette[strings.length % SETTINGS.palette.length]; liveString.sat = 0.8; }
     liveString.a = { ...target[0] }; liveString.b = { ...target[1] };
+    setHum(noteForLength(dist(liveString.a, liveString.b)), true);
     if (pinchers.length >= 2) for (const h of pinchers) h.anchor = { ...h.p }; // so letting go of one hand doesn't jump
   } else if (liveString) {
     // released: leave it hanging in the air with a little twang
+    setHum(0, false);
     if (dist(liveString.a, liveString.b) > SETTINGS.minLength) {
       liveString.live = false; liveString.amp = 10; liveString.t0 = now; liveString.flash = 0.8;
       playNote(noteForLength(dist(liveString.a, liveString.b)), 0.25, (liveString.a.x + liveString.b.x) / 2);
@@ -357,6 +387,7 @@ function loop(now) {
   ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1);
   ctx.drawImage(video, view.ox, view.oy, view.vw * view.s, view.vh * view.s);
   ctx.restore();
+  if (mono) { ctx.globalCompositeOperation = 'saturation'; ctx.fillStyle = '#808080'; ctx.fillRect(0, 0, W, H); ctx.globalCompositeOperation = 'source-over'; }
   ctx.fillStyle = `rgba(0,0,0,${SETTINGS.darken})`; ctx.fillRect(0, 0, W, H);
 
   if (showSkeleton) drawSkeleton();
@@ -383,6 +414,26 @@ const bSkel = document.getElementById('bSkel'), bSound = document.getElementById
 const toggleSkel = () => { showSkeleton = !showSkeleton; bSkel.classList.toggle('on', showSkeleton); };
 const toggleSound = () => { soundOn = !soundOn; bSound.classList.toggle('on', soundOn); };
 const clearAll = () => { strings.forEach(s => s.dying = s.dying || 0.001); };
+// Mono: black-and-white camera so the coloured light stands out
+let mono = false;
+const bMono = document.getElementById('bMono');
+const toggleMono = () => { mono = !mono; bMono.classList.toggle('on', mono); };
+bMono.onclick = toggleMono;
+// Harp: lays out ready-made strings across the frame, staggered like the reference,
+// each one a step of the scale (longest = lowest)
+function harp() {
+  clearAll();
+  const n = 6, now = performance.now();
+  for (let i = 0; i < n; i++) {
+    const y = H * (0.22 + i * 0.1);
+    const len = W * (0.78 - i * 0.07);
+    const x0 = W * 0.5 - len / 2 + (i % 2 ? -W * 0.04 : W * 0.04);
+    const s = makeString({ x: x0, y }, { x: x0 + len, y: y + (i - 2.5) * 6 });
+    s.hue = SETTINGS.palette[i % SETTINGS.palette.length]; s.born = now + i * 90;
+    strings.push(s);
+  }
+}
+document.getElementById('bHarp').onclick = harp;
 bSkel.onclick = toggleSkel; bSound.onclick = toggleSound; document.getElementById('bClear').onclick = clearAll;
 
 // recording: saves a .webm video (with sound) of the canvas
@@ -407,7 +458,7 @@ function toggleRec() {
 recBtn.onclick = toggleRec;
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
-  if (k === 'h') toggleSkel(); else if (k === 'm') toggleSound(); else if (k === 'c') clearAll(); else if (k === 'r') toggleRec();
+  if (k === 'p') harp(); else if (k === 'b') toggleMono(); else if (k === 'h') toggleSkel(); else if (k === 'm') toggleSound(); else if (k === 'c') clearAll(); else if (k === 'r') toggleRec();
 });
 </script>
 </body>
